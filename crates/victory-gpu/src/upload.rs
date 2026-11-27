@@ -44,6 +44,9 @@ fn low() -> bool {
 
 /// The first place of `n` free blocks side by side.
 fn gap(taken: &[bool], n: usize) -> Option<usize> {
+    if n > taken.len() {
+        return None;
+    }
     let mut free = 0;
     for (i, &t) in taken.iter().enumerate() {
         free = if t { 0 } else { free + 1 };
@@ -87,6 +90,13 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     (at != 0).then_some(at)
 }
 
+/// Reject impossible or overflowing arena sizes before requesting memory.
+fn arena_bytes(blocks: usize) -> Option<usize> {
+    let bytes = blocks.checked_mul(BLOCK)?;
+    let window = (1usize << 37) - (1usize << 32);
+    (bytes != 0 && bytes <= window).then_some(bytes)
+}
+
 impl Upload {
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {
@@ -99,9 +109,10 @@ impl Upload {
             Some(place) => place,
             None => {
                 let blocks = n.max(ARENA / BLOCK);
-                let at = reserve(blocks * BLOCK)?;
-                crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
+                let bytes = arena_bytes(blocks)?;
+                let at = reserve(bytes)?;
+                crate::shadow::register(at, at as u64, bytes as u64);
+                tracing::info!(at = format_args!("{at:#x}"), bytes = bytes, "memory for lists' uploads, where shaders reach it by address");
                 arenas.push(Arena { at, taken: vec![false; blocks] });
                 (arenas.len() - 1, 0)
             }
@@ -167,6 +178,17 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn arena_sizes_are_bounded() {
+        assert_eq!(arena_bytes(0), None);
+        assert_eq!(arena_bytes(1), Some(BLOCK));
+        assert_eq!(arena_bytes(usize::MAX), None);
+        let max = ((1usize << 37) - (1usize << 32)) / BLOCK;
+        assert!(arena_bytes(max).is_some());
+        assert_eq!(arena_bytes(max + 1), None);
+        assert_eq!(gap(&[false; 64], 65), None);
     }
 
     #[test]
