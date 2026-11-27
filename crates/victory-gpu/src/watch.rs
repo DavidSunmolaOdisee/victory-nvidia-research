@@ -549,6 +549,44 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_rest(ranges);
 }
 
+/// A containment index, not an interval union: adjacent observations
+/// must not stand in for a single observation that covered both.
+#[derive(Default)]
+struct RangeCoverage {
+    ends: BTreeMap<usize, usize>,
+}
+
+impl RangeCoverage {
+    fn contains(&self, first: usize, last: usize) -> bool {
+        self.ends.range(..=first).next_back().is_some_and(|(_, end)| last <= *end)
+    }
+
+    fn insert(&mut self, first: usize, last: usize) {
+        if self.contains(first, last) {
+            return;
+        }
+        // Retain only maximal intervals. Endpoints increase with starts.
+        while let Some((&start, &end)) = self.ends.range(first..).next() {
+            if end > last {
+                break;
+            }
+            self.ends.remove(&start);
+        }
+        self.ends.insert(first, last);
+    }
+
+    fn from_ranges(ranges: &[(usize, usize)]) -> Self {
+        let mut index = Self::default();
+        for &(first, last) in ranges {
+            index.insert(first, last);
+        }
+        index
+    }
+}
+
+// For small lists a direct scan avoids the cost of building an index.
+const COVERAGE_INDEX_THRESHOLD: usize = 256;
+
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
@@ -562,17 +600,28 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let mut coverage = (ahead.len() >= COVERAGE_INDEX_THRESHOLD)
+        .then(|| RangeCoverage::from_ranges(&ahead));
     let mut written = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        let covered = match &coverage {
+            Some(index) => index.contains(first, last),
+            None => ahead.iter().any(|&(a, b)| a <= first && last <= b),
+        };
+        if !covered
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
             ahead.push((first, last));
+            if let Some(index) = &mut coverage {
+                index.insert(first, last);
+            } else if ahead.len() >= COVERAGE_INDEX_THRESHOLD {
+                coverage = Some(RangeCoverage::from_ranges(&ahead));
+            }
         }
     }
     note_hot(&written);
@@ -3242,6 +3291,40 @@ pub(crate) mod test_books {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn containment_index_preserves_individual_observations() {
+        let mut index = RangeCoverage::default();
+        index.insert(0, 10);
+        index.insert(10, 20);
+        assert!(!index.contains(0, 20));
+        index.insert(0, 20);
+        assert!(index.contains(0, 20));
+        assert_eq!(index.ends.len(), 1);
+
+        let mut state = 99u64;
+        let mut random = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) as usize
+        };
+        for i in 0..256 {
+            let mut observations = Vec::new();
+            let mut index = RangeCoverage::default();
+            for _ in 0..(i * 2) {
+                let start = random() % 2000;
+                let end = start + random() % 60;
+                assert_eq!(
+                    index.contains(start, end),
+                    observations.iter().any(|&(a, b)| a <= start && end <= b)
+                );
+                // Include failed observations, which must never be inserted.
+                if random() % 5 != 0 {
+                    observations.push((start, end));
+                    index.insert(start, end);
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
