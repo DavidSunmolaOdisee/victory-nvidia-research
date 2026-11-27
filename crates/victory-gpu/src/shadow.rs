@@ -802,17 +802,16 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    // (The sort that finds what is in order already: they come as a few
-    // stretches of tens of thousands in order, put behind one another.)
+    // Preserve the adaptive sort and compact the sorted ranges in place.
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    ranges.dedup_by(|next, last| {
+        if next.0 > last.1 {
+            return false;
         }
-    }
-    out
+        last.1 = last.1.max(next.1);
+        true
+    });
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -957,6 +956,13 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+        // Preserve the original allocation, including when all ranges are disjoint.
+        let input = vec![(0, 2), (4, 6), (8, 10)];
+        let ptr = input.as_ptr();
+        let result = joined(input);
+        assert_eq!(result, [(0, 2), (4, 6), (8, 10)]);
+        assert_eq!(result.as_ptr(), ptr);
+        assert_eq!(joined(vec![(2, 9), (2, 3), (5, 7), (9, 10)]), [(2, 10)]);
     }
 }
 
